@@ -1,0 +1,492 @@
+diff --git a/include/mpv/client.h b/include/mpv/client.h
+index 85cff63..db46437 100644
+--- a/include/mpv/client.h
++++ b/include/mpv/client.h
+@@ -2025,6 +2025,39 @@ MPV_DEFINE_SYM_PTR(mpv_get_wakeup_pipe)
+ 
+ #endif
+ 
++/**
++ * Fast seek-preview thumbnail, extracted by an independent FFmpeg decode
++ * instance that bypasses the playback pipeline completely (ported from
++ * mpvlibAndroid's thumbnail.cpp). The JavaVM required by FFmpeg's
++ * MediaCodec wrapper must already be registered through
++ * mpv_lavc_set_java_vm().
++ *
++ * @param path      video file path (local filesystem only)
++ * @param position  timestamp in seconds (0.0 = first frame)
++ * @param dimension larger side of the output image in pixels (1..4096)
++ * @param use_hwdec 1 to prefer MediaCodec with automatic software fallback
++ * @param out_data  receives a tightly packed RGBA8888 buffer, release it
++ *                  with mk_thumbnail_free()
++ * @param out_width  output width in pixels
++ * @param out_height output height in pixels
++ *
++ * @return 0 on success, a negative AVERROR otherwise
++ */
++MPV_EXPORT int mk_thumbnail_grab(const char *path, double position, int dimension,
++                                 int use_hwdec, unsigned char **out_data,
++                                 int *out_width, int *out_height);
++
++/**
++ * Release a buffer returned by mk_thumbnail_grab().
++ */
++MPV_EXPORT void mk_thumbnail_free(unsigned char *data);
++
++/**
++ * Drop the cached MediaCodec device context (it is re-created on demand).
++ */
++MPV_EXPORT void mk_thumbnail_clear_cache(void);
++
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/meson.build b/meson.build
+index 5ffe559..ae05627 100644
+--- a/meson.build
++++ b/meson.build
+@@ -134,6 +134,7 @@ sources = files(
+     'input/keycodes.c',
+ 
+     ## Misc
++    'player/thumbnail.c',
+     'misc/bstr.c',
+     'misc/charset_conv.c',
+     'misc/codepoint_width.c',
+@@ -479,6 +480,7 @@ endif
+ features += {'android': host_machine.system() == 'android'}
+ if features['android']
+     dependencies += cc.find_library('android')
++    dependencies += cc.find_library('log')
+     sources += files('misc/jni.c',
+                      'osdep/android/strnlen.c',
+                      'video/out/android_common.c',
+diff --git a/player/thumbnail.c b/player/thumbnail.c
+new file mode 100644
+index 0000000..49f92ca
+--- /dev/null
++++ b/player/thumbnail.c
+@@ -0,0 +1,422 @@
++/*
++ * mk_thumbnail — fast seek-preview thumbnails extracted by an independent
++ * FFmpeg decode instance that bypasses the mpv playback pipeline entirely.
++ *
++ * Ported to plain C from mpvlibAndroid's app/src/main/jni/thumbnail.cpp
++ * (is.xyz.mpv.MPVLib). The JavaVM required by FFmpeg's MediaCodec wrapper
++ * is registered process-wide by media-kit through mpv_lavc_set_java_vm(),
++ * so no extra initialization is needed here.
++ *
++ * Public entry points (declared in client.h):
++ *   mk_thumbnail_grab()       grab a scaled RGBA frame at a timestamp
++ *   mk_thumbnail_free()       release the buffer returned by mk_thumbnail_grab
++ *   mk_thumbnail_clear_cache() drop the cached MediaCodec device context
++ */
++
++#include <pthread.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <time.h>
++
++/* Pulls in the MPV_EXPORT prototypes for mk_thumbnail_*: libmpv is built with
++ * gnu_symbol_visibility='hidden', so the definitions only get exported when
++ * the compiler has seen the visibility("default") declarations. */
++#include "mpv/client.h"
++
++#include <libavformat/avformat.h>
++#include <libavcodec/avcodec.h>
++#include <libavutil/dict.h>
++#include <libavutil/error.h>
++#include <libavutil/hwcontext.h>
++#include <libavutil/mathematics.h>
++#include <libavutil/pixdesc.h>
++#include <libswscale/swscale.h>
++
++#ifdef __ANDROID__
++#include <android/log.h>
++#define MK_LOG(tag, ...) \
++    __android_log_print(ANDROID_LOG_INFO, "MKThumb", tag " | " __VA_ARGS__)
++#else
++#define MK_LOG(tag, ...) do { } while (0)
++#endif
++
++/* MediaCodec device context is expensive to create; keep one per process. */
++static pthread_mutex_t g_hw_ctx_mutex = PTHREAD_MUTEX_INITIALIZER;
++static AVBufferRef *g_hw_device_ctx = NULL;
++static bool g_hw_ctx_initialized = false;
++static bool g_hw_ctx_available = false;
++
++static bool init_hw_device_context(void)
++{
++    pthread_mutex_lock(&g_hw_ctx_mutex);
++
++    if (g_hw_ctx_initialized) {
++        pthread_mutex_unlock(&g_hw_ctx_mutex);
++        return g_hw_ctx_available;
++    }
++    g_hw_ctx_initialized = true;
++
++    enum AVHWDeviceType hw_type = av_hwdevice_find_type_by_name("mediacodec");
++    if (hw_type == AV_HWDEVICE_TYPE_NONE) {
++        MK_LOG("HW", "MediaCodec device type not found");
++        pthread_mutex_unlock(&g_hw_ctx_mutex);
++        return false;
++    }
++
++    if (av_hwdevice_ctx_create(&g_hw_device_ctx, hw_type, NULL, NULL, 0) < 0) {
++        MK_LOG("HW", "Failed to create MediaCodec device context");
++        pthread_mutex_unlock(&g_hw_ctx_mutex);
++        return false;
++    }
++
++    MK_LOG("HW", "MediaCodec device context initialized");
++    pthread_mutex_unlock(&g_hw_ctx_mutex);
++    return true;
++}
++
++static void destroy_hw_device_context_locked(void)
++{
++    if (g_hw_device_ctx) {
++        av_buffer_unref(&g_hw_device_ctx);
++        g_hw_device_ctx = NULL;
++    }
++    g_hw_ctx_initialized = false;
++    g_hw_ctx_available = false;
++}
++
++/* If the decoded frame is a hardware frame, transfer it to system memory. */
++static AVFrame *get_scalable_frame(AVFrame *frame)
++{
++    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
++    if (!desc || !(desc->flags & AV_PIX_FMT_FLAG_HWACCEL))
++        return frame;
++
++    AVFrame *sw_frame = av_frame_alloc();
++    if (!sw_frame)
++        return NULL;
++
++    if (av_hwframe_transfer_data(sw_frame, frame, 0) < 0) {
++        MK_LOG("HW", "Failed to transfer hardware frame to memory");
++        av_frame_free(&sw_frame);
++        return NULL;
++    }
++    return sw_frame;
++}
++
++/* Scale |frame| so its larger side becomes |dimension|, keeping the aspect
++ * ratio. Returns a tightly packed RGBA buffer the caller must free with
++ * mk_thumbnail_free(). */
++static int frame_to_rgba(AVFrame *frame, int dimension,
++                         unsigned char **out_data, int *out_width, int *out_height)
++{
++    int width = frame->width;
++    int height = frame->height;
++    if (width <= 0 || height <= 0)
++        return AVERROR(EINVAL);
++
++    float scale = 1.0f;
++    if (width >= height) {
++        if (width > dimension)
++            scale = (float)dimension / width;
++    } else {
++        if (height > dimension)
++            scale = (float)dimension / height;
++    }
++    width = (int)(width * scale);
++    height = (int)(height * scale);
++    if (width < 1)
++        width = 1;
++    if (height < 1)
++        height = 1;
++
++    unsigned char *data = malloc((size_t)width * height * 4);
++    if (!data)
++        return AVERROR(ENOMEM);
++
++    struct SwsContext *sws = sws_getContext(
++        frame->width, frame->height, frame->format,
++        width, height, AV_PIX_FMT_RGBA,
++        SWS_FAST_BILINEAR, NULL, NULL, NULL);
++    if (!sws) {
++        free(data);
++        return AVERROR(ENOMEM);
++    }
++
++    uint8_t *dst_data[4] = { data };
++    int dst_linesize[4] = { width * 4 };
++    int scaled_height = sws_scale(sws, (const uint8_t *const *)frame->data,
++                                  frame->linesize, 0, frame->height,
++                                  dst_data, dst_linesize);
++    sws_freeContext(sws);
++
++    if (scaled_height <= 0) {
++        free(data);
++        return AVERROR_UNKNOWN;
++    }
++
++    *out_data = data;
++    *out_width = width;
++    *out_height = height;
++    return 0;
++}
++
++static int grab_thumbnail_impl(const char *path, double position, int dimension,
++                               bool use_hwdec,
++                               unsigned char **out_data, int *out_width, int *out_height)
++{
++    struct timespec t0;
++    clock_gettime(CLOCK_MONOTONIC, &t0);
++
++    if (dimension <= 0 || dimension > 4096)
++        return AVERROR(EINVAL);
++
++    /* Ultra-fast stream probing: enough to find the video stream & codecs. */
++    AVDictionary *format_options = NULL;
++    av_dict_set(&format_options, "probesize", "500000", 0);
++    av_dict_set(&format_options, "analyzeduration", "100000", 0);
++    av_dict_set(&format_options, "fpsprobesize", "1", 0);
++    av_dict_set(&format_options, "max_probe_packets", "32", 0);
++
++    AVFormatContext *format_ctx = NULL;
++    if (avformat_open_input(&format_ctx, path, NULL, &format_options) < 0) {
++        MK_LOG("FF", "Failed to open %s", path);
++        av_dict_free(&format_options);
++        return AVERROR_UNKNOWN;
++    }
++    av_dict_free(&format_options);
++
++    format_ctx->max_analyze_duration = 100000;
++    format_ctx->probesize = 500000;
++    format_ctx->fps_probe_size = 1;
++    format_ctx->max_ts_probe = 1;
++
++    if (avformat_find_stream_info(format_ctx, NULL) < 0) {
++        MK_LOG("FF", "Failed to find stream info");
++        avformat_close_input(&format_ctx);
++        return AVERROR_UNKNOWN;
++    }
++
++    int video_stream_idx = -1;
++    for (unsigned int i = 0; i < format_ctx->nb_streams; i++) {
++        if (format_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
++            video_stream_idx = i;
++            break;
++        }
++    }
++    if (video_stream_idx == -1) {
++        MK_LOG("FF", "No video stream");
++        avformat_close_input(&format_ctx);
++        return AVERROR_UNKNOWN;
++    }
++    AVStream *video_stream = format_ctx->streams[video_stream_idx];
++
++    const AVCodec *codec = avcodec_find_decoder(video_stream->codecpar->codec_id);
++    if (!codec) {
++        MK_LOG("FF", "No decoder for codec id %d", video_stream->codecpar->codec_id);
++        avformat_close_input(&format_ctx);
++        return AVERROR_DECODER_NOT_FOUND;
++    }
++
++    AVCodecContext *codec_ctx = avcodec_alloc_context3(codec);
++    if (!codec_ctx) {
++        avformat_close_input(&format_ctx);
++        return AVERROR(ENOMEM);
++    }
++
++    if (avcodec_parameters_to_context(codec_ctx, video_stream->codecpar) < 0) {
++        MK_LOG("FF", "Failed to copy codec parameters");
++        avcodec_free_context(&codec_ctx);
++        avformat_close_input(&format_ctx);
++        return AVERROR_UNKNOWN;
++    }
++
++    /* Everything below is tuned for single-frame extraction speed. */
++    codec_ctx->thread_count = 0;
++    codec_ctx->thread_type = FF_THREAD_SLICE;
++    codec_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
++    codec_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
++    codec_ctx->skip_frame = AVDISCARD_NONREF;
++    codec_ctx->skip_idct = AVDISCARD_BIDIR;
++    codec_ctx->skip_loop_filter = AVDISCARD_ALL;
++    codec_ctx->export_side_data = 0;
++    codec_ctx->err_recognition = 0;
++    codec_ctx->workaround_bugs = 0;
++    codec_ctx->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
++
++    if (use_hwdec && init_hw_device_context()) {
++        pthread_mutex_lock(&g_hw_ctx_mutex);
++        if (g_hw_device_ctx)
++            codec_ctx->hw_device_ctx = av_buffer_ref(g_hw_device_ctx);
++        pthread_mutex_unlock(&g_hw_ctx_mutex);
++    }
++
++    if (avcodec_open2(codec_ctx, codec, NULL) < 0) {
++        MK_LOG("FF", "Failed to open decoder %s%s", codec->name,
++               use_hwdec ? " (hw)" : " (sw)");
++        avcodec_free_context(&codec_ctx);
++        avformat_close_input(&format_ctx);
++        return AVERROR_UNKNOWN;
++    }
++
++    /* Seek close to the target position (skip when near the start). */
++    if (position > 1.0 && position < (double)INT64_MAX / AV_TIME_BASE) {
++        int64_t timestamp = (int64_t)(position * AV_TIME_BASE);
++        AVRational av_time_base_q = { 1, AV_TIME_BASE };
++        int64_t stream_timestamp = av_rescale_q(timestamp, av_time_base_q,
++                                                video_stream->time_base);
++        if (av_seek_frame(format_ctx, video_stream_idx, stream_timestamp,
++                          AVSEEK_FLAG_BACKWARD) < 0 &&
++            av_seek_frame(format_ctx, video_stream_idx, stream_timestamp,
++                          AVSEEK_FLAG_ANY) < 0) {
++            MK_LOG("FF", "Seek failed, using first frame");
++        }
++        avcodec_flush_buffers(codec_ctx);
++    }
++
++    AVPacket *packet = av_packet_alloc();
++    AVFrame *frame = av_frame_alloc();
++    if (!packet || !frame) {
++        if (packet)
++            av_packet_free(&packet);
++        if (frame)
++            av_frame_free(&frame);
++        avcodec_free_context(&codec_ctx);
++        avformat_close_input(&format_ctx);
++        return AVERROR(ENOMEM);
++    }
++
++    unsigned char *data = NULL;
++    int out_w = 0, out_h = 0;
++    bool frame_found = false;
++    int frames_decoded = 0;
++    int packets_read = 0;
++    const int MAX_FRAMES = 600;
++    const int MAX_PACKETS = 2048;
++
++    while (av_read_frame(format_ctx, packet) >= 0 &&
++           frames_decoded < MAX_FRAMES &&
++           packets_read < MAX_PACKETS) {
++        packets_read++;
++
++        if (packet->stream_index == video_stream_idx) {
++            if (avcodec_send_packet(codec_ctx, packet) >= 0) {
++                while (avcodec_receive_frame(codec_ctx, frame) >= 0) {
++                    frames_decoded++;
++
++                    bool has_frame_time = false;
++                    double frame_time = 0.0;
++                    if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
++                        frame_time = frame->best_effort_timestamp *
++                                     av_q2d(video_stream->time_base);
++                        has_frame_time = true;
++                    } else if (frame->pts != AV_NOPTS_VALUE) {
++                        frame_time = frame->pts * av_q2d(video_stream->time_base);
++                        has_frame_time = true;
++                    }
++
++                    /* Accurate timestamp matching: decode forward until the
++                     * frame timestamp reaches the target. */
++                    const double skip_tolerance = 0.0;
++                    const double match_tolerance = 0.0;
++
++                    if (has_frame_time && position > 0.0 &&
++                        frame_time < position - skip_tolerance) {
++                        av_frame_unref(frame);
++                        continue;
++                    }
++
++                    if (!has_frame_time || position == 0.0 ||
++                        frame_time >= position - match_tolerance) {
++                        AVFrame *rgba_frame = get_scalable_frame(frame);
++                        if (rgba_frame) {
++                            int ret = frame_to_rgba(rgba_frame, dimension,
++                                                    &data, &out_w, &out_h);
++                            if (rgba_frame != frame)
++                                av_frame_free(&rgba_frame);
++                            if (ret == 0) {
++                                frame_found = true;
++                                av_frame_unref(frame);
++                                break;
++                            }
++                        }
++                    }
++
++                    av_frame_unref(frame);
++                }
++            }
++
++            if (frame_found) {
++                av_packet_unref(packet);
++                break;
++            }
++        }
++
++        av_packet_unref(packet);
++    }
++
++    av_frame_free(&frame);
++    av_packet_free(&packet);
++    avcodec_free_context(&codec_ctx);
++    avformat_close_input(&format_ctx);
++
++    if (!frame_found) {
++        MK_LOG("FF", "Failed: no frame found (%d frames, %d packets)",
++               frames_decoded, packets_read);
++        return AVERROR_UNKNOWN;
++    }
++
++    struct timespec t1;
++    clock_gettime(CLOCK_MONOTONIC, &t1);
++    long elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000L +
++                      (t1.tv_nsec - t0.tv_nsec) / 1000000L;
++    MK_LOG("FF", "%dx%d in %ldms (hw=%d, frames=%d, packets=%d)",
++           out_w, out_h, elapsed_ms, use_hwdec ? 1 : 0, frames_decoded, packets_read);
++
++    *out_data = data;
++    *out_width = out_w;
++    *out_height = out_h;
++    return 0;
++}
++
++int mk_thumbnail_grab(const char *path, double position, int dimension,
++                      int use_hwdec, unsigned char **out_data,
++                      int *out_width, int *out_height)
++{
++    if (!path || !path[0])
++        return AVERROR(EINVAL);
++    if (dimension <= 0 || dimension > 4096)
++        return AVERROR(EINVAL);
++    /* NaN / negative positions are rejected just like the original. */
++    if (position != position || position < 0.0)
++        return AVERROR(EINVAL);
++
++    int ret = grab_thumbnail_impl(path, position, dimension, use_hwdec != 0,
++                                  out_data, out_width, out_height);
++    if (ret != 0 && use_hwdec) {
++        MK_LOG("FF", "Hardware path failed, retrying with software decode");
++        ret = grab_thumbnail_impl(path, position, dimension, false,
++                                  out_data, out_width, out_height);
++    }
++    return ret;
++}
++
++void mk_thumbnail_free(unsigned char *data)
++{
++    free(data);
++}
++
++void mk_thumbnail_clear_cache(void)
++{
++    pthread_mutex_lock(&g_hw_ctx_mutex);
++    destroy_hw_device_context_locked();
++    pthread_mutex_unlock(&g_hw_ctx_mutex);
++}
++
++static void cleanup_thumbnail_resources(void) __attribute__((destructor));
++static void cleanup_thumbnail_resources(void)
++{
++    pthread_mutex_lock(&g_hw_ctx_mutex);
++    destroy_hw_device_context_locked();
++    pthread_mutex_unlock(&g_hw_ctx_mutex);
++}
